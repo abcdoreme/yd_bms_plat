@@ -497,7 +497,7 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 			}
 			cJSON_AddNumberToObject(root, "Result", RESULT_SUCCESS);
 			cJSON_AddStringToObject(root, "PONG", "PONG");
-			cJSON_AddNumberToObject(root, "Interval", 120);
+			cJSON_AddNumberToObject(root, "Interval", cli->heartbeat);
 			reply = cJSON_PrintUnformatted(root);
 			DBG_LOG(DBG_DEBUG, "reply HB: %s\n", reply);
 			msg_len = htonl(strlen(reply));
@@ -548,7 +548,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				cJSON_AddNumberToObject(root, "result", result);
 				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
 				reply = cJSON_PrintUnformatted(root);
-				bufferevent_write(cli->web->bev, reply, strlen(reply));
+				if(cli->web && cli->web->bev){
+					bufferevent_write(cli->web->bev, reply, strlen(reply));
+				}
 				cJSON_Delete(root);
 				cJSON_Delete(request);
 				break;
@@ -570,7 +572,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 					cJSON_AddNumberToObject(root, "Percent", item->valueint);
 				}
 				reply = cJSON_PrintUnformatted(root);
-				bufferevent_write(cli->web->bev, reply, strlen(reply));
+				if(cli->web && cli->web->bev){
+					bufferevent_write(cli->web->bev, reply, strlen(reply));
+				}
 				cJSON_Delete(root);
 				cJSON_Delete(request);
 				break;
@@ -588,7 +592,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				cJSON_AddNumberToObject(root, "result", result);
 				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
 				reply = cJSON_PrintUnformatted(root);
-				bufferevent_write(cli->web->bev, reply, strlen(reply));
+				if(cli->web && cli->web->bev){
+					bufferevent_write(cli->web->bev, reply, strlen(reply));
+				}
 				cJSON_Delete(root);
 				cJSON_Delete(request);
 				break;
@@ -606,7 +612,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				cJSON_AddNumberToObject(root, "result", result);
 				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
 				reply = cJSON_PrintUnformatted(root);
-				bufferevent_write(cli->web->bev, reply, strlen(reply));
+				if(cli->web && cli->web->bev){
+					bufferevent_write(cli->web->bev, reply, strlen(reply));
+				}
 				cJSON_Delete(root);
 				cJSON_Delete(request);
 				break;
@@ -624,7 +632,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				cJSON_AddNumberToObject(root, "result", result);
 				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
 				reply = cJSON_PrintUnformatted(root);
-				bufferevent_write(cli->web->bev, reply, strlen(reply));
+				if(cli->web && cli->web->bev){
+					bufferevent_write(cli->web->bev, reply, strlen(reply));
+				}
 				cJSON_Delete(root);
 				cJSON_Delete(request);
 				break;
@@ -642,7 +652,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				cJSON_AddNumberToObject(root, "result", result);
 				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
 				reply = cJSON_PrintUnformatted(root);
-				bufferevent_write(cli->web->bev, reply, strlen(reply));
+				if(cli->web && cli->web->bev){
+					bufferevent_write(cli->web->bev, reply, strlen(reply));
+				}
 				cJSON_Delete(root);
 				cJSON_Delete(request);
 				break;
@@ -660,7 +672,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				cJSON_AddNumberToObject(root, "result", result);
 				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
 				reply = cJSON_PrintUnformatted(root);
-				bufferevent_write(cli->web->bev, reply, strlen(reply));
+				if(cli->web && cli->web->bev){
+					bufferevent_write(cli->web->bev, reply, strlen(reply));
+				}
 				cJSON_Delete(root);
 				cJSON_Delete(request);
 				break;
@@ -695,7 +709,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				reply = cJSON_PrintUnformatted(root);
 				
 				DBG_LOG(DBG_DEBUG, "%s[%d]:reply to web:%s\n", __func__, __LINE__, reply);
-				bufferevent_write(cli->web->bev, reply, strlen(reply));
+				if(cli->web && cli->web->bev){
+					bufferevent_write(cli->web->bev, reply, strlen(reply));
+				}
 				cJSON_Delete(root);
 				cJSON_Delete(request);
 				break;
@@ -867,7 +883,8 @@ void on_read(struct bufferevent *bev, void *ctx)
 			if(row[6]) strncpy(cli->password, row[6], sizeof(cli->password));			
 			if(row[7]) cli->haswifi = atoi(row[7]);
 			if(row[8]) strncpy(cli->province, row[8], sizeof(cli->province));
-			if(row[7]) cli->isShortConn = atoi(row[9]);
+			if(row[9]) cli->isShortConn = atoi(row[9]);
+			if(row[10]) cli->heartbeat = atoi(row[10]);
 			cli->local_method = RPCMETHOD_HB;
 			if(g_cli_head == NULL){
 				g_cli_head = &cli->cli_list;
@@ -1189,6 +1206,7 @@ void unix_write(struct bufferevent *bev, void *ctx)
 
 void unix_error(struct bufferevent *bev, short events, void *ctx)
 {
+	struct bms_client * cli = NULL;
 	BMS_WEB_REQUEST_T *web = (BMS_WEB_REQUEST_T *)ctx;
 	
 	DBG_LOG(DBG_DEBUG, "%s[%d]: ctx=%p, event=0x%X!\n", __func__, __LINE__, ctx, events);
@@ -1196,6 +1214,9 @@ void unix_error(struct bufferevent *bev, short events, void *ctx)
     if (events & BEV_EVENT_ERROR || events & BEV_EVENT_EOF) {
         close_connection(bev);
 		bms_list_delete(&g_web_request_head, &web->web_list);
+		if(cli = find_client(web->mac)){
+			cli->web = NULL;
+		}
 		free(web);
     }
 }
