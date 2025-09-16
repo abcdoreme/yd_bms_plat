@@ -50,6 +50,7 @@ typedef struct bms_client {
 	unsigned char haswifi;
 	unsigned char pendding;
 	unsigned char local_method;	//本地method, 记录web传过来的method
+	unsigned char isShortConn;
 	int session_id;
 	struct sockaddr client_addr;
 	char challenge_code[18];

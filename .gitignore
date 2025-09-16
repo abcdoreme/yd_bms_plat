@@ -1,1 +1,3 @@
 /libevent/
+/*.o
+/bms

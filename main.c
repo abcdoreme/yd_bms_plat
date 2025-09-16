@@ -10,6 +10,7 @@
 #include <sys/un.h>
 
 #include <mysql/mysql.h>
+#include <mysql/mysqld_error.h>
 
 #include <event2/listener.h>
 #include <event2/bufferevent.h>
@@ -21,8 +22,8 @@
 #include "md5.h"
 
 #define MYSQL_DATABASE "bms"
-#define DB_DEVICE_TABLE "device"
-#define DB_RECORD_TABLE "record"
+#define DB_DEVICE_TABLE "bms_web_device"
+#define DB_RECORD_TABLE "bms_web_record"
 
 #define UNIX_SOCKET_PATH "/tmp/.bms.sock"
 #define RECV_BUF_LEN 2048
@@ -35,6 +36,7 @@ struct bms_list *g_cli_head = NULL;
 /* 收到的请求操作链表,按照收到的先后顺序入链,同一类型的操作只执行一次 */
 struct bms_list *g_web_request_head = NULL;
 
+unsigned int g_mysql_tick = 0;
 
 struct bms_client * find_client(unsigned char *mac)
 {
@@ -88,7 +90,7 @@ void bms_list_delete(struct bms_list **head, struct bms_list *node)
 	
 	if(*head == NULL || node == NULL)
 		return;
-
+	printf("TXLDebug,%s[%d]:head=%p,node=%p\n", __func__, __LINE__, *head, node);
 	if(*head == node){
 		tmp = (*head)->next;
 		*head = tmp;
@@ -136,6 +138,25 @@ void web_list_free()
 	return;
 }
 
+void connect_to_mysql(void)
+{
+	if (mysql_real_connect(
+            g_mysql_conn,      // 连接对象
+            "localhost",      // 主机名
+            //"root",       	// 用户名
+            //"hx123456",       // 密码
+            "hx",
+            "Hx@123456",
+            MYSQL_DATABASE,   // 数据库名
+            0,                // 端口 (0 表示默认)
+            NULL,             // Unix socket (NULL 表示默认)
+            0                 // 客户端标志
+        ) == NULL) {
+        fprintf(stderr, "连接失败: %s\n", mysql_error(g_mysql_conn));
+        mysql_close(g_mysql_conn);
+        exit(1);
+    }
+}
 
 static void signal_handler(evutil_socket_t sig, short events, void *user_data)
 {
@@ -490,8 +511,16 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 
 			/* 回复PONG之后返回,其他操作放在on_write中 */
 			cli->status = AUTH_SUCCESS;
-			/* 放到网页请求消息中修改这个值 */
-			//cli->local_method = bms_dev->localMethod;
+			memset(query_cmd, 0, sizeof(query_cmd));
+			sprintf(query_cmd, "update %s set status=1,tr069='%s' where mac = '%s'", DB_DEVICE_TABLE, cli->tr069Addr, cli->mac);
+			if (mysql_query(g_mysql_conn, query_cmd)) {
+		        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+				return -1;
+		    }
+			/* 如果是短连接,在回复了一个heartbeat之后下一次收到HB直接关闭连接 */
+			if(cli->isShortConn && cli->local_method == RPCMETHOD_HB){
+				cli->local_method = RPCMETHOD_NONE;
+			}
 		}
 	}
 	/* 设备发送报文中不带RPCMethod字段 */
@@ -653,6 +682,15 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				if(item){
 					cJSON_DetachItemFromObject(request, "Plugin");
 					cJSON_AddItemToObject(root, "Plugin", item);
+					char *pluginlist = cJSON_PrintUnformatted(item);
+					DBG_LOG(DBG_DEBUG, "%s[%d]:pluginlist:%s\n", __func__, __LINE__, pluginlist);
+					memset(query_cmd, 0, sizeof(query_cmd));
+					sprintf(query_cmd, "update %s set pluginList='%s' where mac='%s'", DB_DEVICE_TABLE, pluginlist, cli->mac);
+					DBG_LOG(DBG_DEBUG, "%s[%d]:query_cmd:%s\n", __func__, __LINE__, query_cmd);
+					if (mysql_query(g_mysql_conn, query_cmd)) {
+				        DBG_LOG(DBG_ERR, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+						return -1;
+				    }
 				}
 				reply = cJSON_PrintUnformatted(root);
 				
@@ -666,7 +704,12 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 		}
 		/* 更新localMethod为RPCMETHOD_HB,长连接 */
 		cli->method = RPCMETHOD_HB;
-		cli->local_method = RPCMETHOD_HB;
+		/* 如果是短连接,下一次收到HB的时候直接关闭连接 */
+		if(cli->isShortConn){
+			cli->local_method = RPCMETHOD_NONE;
+		}else{
+			cli->local_method = RPCMETHOD_HB;
+		}
 
 		cli->pendding = 0;
 		cli->web->active = 0;
@@ -687,6 +730,8 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 // 数据读取回调
 void on_read(struct bufferevent *bev, void *ctx)
 {
+	int ret = 0;
+	int count = 0;
 	cJSON* request = NULL;
 	cJSON* root = NULL;
 	cJSON* item = NULL;
@@ -777,11 +822,20 @@ void on_read(struct bufferevent *bev, void *ctx)
 
 	if(0 == strlen(cli->mac)){
 		/* 在record表中查询是否存在此设备,若不存在返回-2 */
+	__retry__:
 		sprintf(query_cmd, "select * from %s where mac = '%s'", DB_RECORD_TABLE, device.mac);
-	    if (mysql_query(g_mysql_conn, query_cmd)) {
+	    if (ret = mysql_query(g_mysql_conn, query_cmd)) {
 	        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+			if((ret == ER_CLIENT_INTERACTION_TIMEOUT || ret == CR_SERVER_LOST) && count < 3){
+				count++;
+				mysql_close(g_mysql_conn);
+				connect_to_mysql();
+				DBG_LOG(DBG_DEBUG, "retry mysql_query\n");
+				goto __retry__;
+			}
 			goto __exit__;
 	    }
+		g_mysql_tick = 0;
 
 	    res = mysql_use_result(g_mysql_conn);
 		row = mysql_fetch_row(res);
@@ -805,14 +859,15 @@ void on_read(struct bufferevent *bev, void *ctx)
 			goto __reply__;
 		}else{
 			/* 只有在record表中存在的设备才会记录MAC */
-			if(row[0]) strncpy(cli->mac, row[0], sizeof(cli->mac));
-			if(row[1]) strncpy(cli->gponsn, row[1], sizeof(cli->gponsn));
-			if(row[2]) strncpy(cli->ssid, row[2], sizeof(cli->ssid));
-			if(row[3]) strncpy(cli->psk, row[3], sizeof(cli->psk));
-			if(row[4]) strncpy(cli->userpass, row[4], sizeof(cli->userpass));
-			if(row[5]) strncpy(cli->password, row[5], sizeof(cli->password));
-			if(row[6]) strncpy(cli->province, row[6], sizeof(cli->province));
+			if(row[1]) strncpy(cli->mac, row[1], sizeof(cli->mac));
+			if(row[2]) strncpy(cli->gponsn, row[2], sizeof(cli->gponsn));
+			if(row[3]) strncpy(cli->ssid, row[3], sizeof(cli->ssid));
+			if(row[4]) strncpy(cli->psk, row[4], sizeof(cli->psk));
+			if(row[5]) strncpy(cli->userpass, row[5], sizeof(cli->userpass));
+			if(row[6]) strncpy(cli->password, row[6], sizeof(cli->password));			
 			if(row[7]) cli->haswifi = atoi(row[7]);
+			if(row[8]) strncpy(cli->province, row[8], sizeof(cli->province));
+			if(row[7]) cli->isShortConn = atoi(row[9]);
 			cli->local_method = RPCMETHOD_HB;
 			if(g_cli_head == NULL){
 				g_cli_head = &cli->cli_list;
@@ -887,7 +942,15 @@ void on_read(struct bufferevent *bev, void *ctx)
 __reply__:
 	if(cli->close){
 		cli->bev = NULL;
+		memset(query_cmd, 0, sizeof(query_cmd));
+		sprintf(query_cmd, "update %s set status=0 where mac = '%s'", DB_DEVICE_TABLE, cli->mac);
+		if (mysql_query(g_mysql_conn, query_cmd)) {
+	        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+	    }
+		
 		close_connection(bev);
+		bms_list_delete(&g_cli_head, &cli->cli_list);
+		free(cli);		
 	}else if(msg_len > 0){
     	bufferevent_write(bev, data, msg_len);
 	}
@@ -902,12 +965,18 @@ __exit__:
 // 错误处理
 void on_error(struct bufferevent *bev, short events, void *ctx)
 {
+	char query_cmd[1024] = {0};
 	BMS_CLIENT_T *cli = (BMS_CLIENT_T*)ctx;
 	DBG_LOG(DBG_DEBUG, "%s[%d]: ctx=%p, event=0x%X!\n", __func__, __LINE__, ctx, events);
 	
     if (events & BEV_EVENT_ERROR || events & BEV_EVENT_EOF) {
-        close_connection(bev);		
+        close_connection(bev);
+		sprintf(query_cmd, "update %s set status=0 where mac = '%s'", DB_DEVICE_TABLE, cli->mac);
+		if (mysql_query(g_mysql_conn, query_cmd)) {
+	        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+	    }
 		bms_list_delete(&g_cli_head, &cli->cli_list);
+		free(cli);
     }
 }
 
@@ -963,14 +1032,7 @@ void unix_read(struct bufferevent *bev, void *ctx)
     evbuffer_remove(input, data, len);
 	DBG_LOG(DBG_DEBUG, "recv message(len=%d):%s!\n", len, data);	
 
-	web_req = malloc(sizeof(BMS_WEB_REQUEST_T));
-	if(web_req == NULL){
-		DBG_LOG(DBG_ERR, "%s[%d]:malloc failed!\n", __func__, __LINE__);
-		return;
-	}
-	memset(web_req, 0, sizeof(BMS_WEB_REQUEST_T));
-	web_req->active = 1;
-	web_req->bev = bev;
+	web_req = (BMS_WEB_REQUEST_T*)ctx;
 	
 	request = cJSON_Parse(data);
 	if(request){
@@ -1056,6 +1118,8 @@ void unix_read(struct bufferevent *bev, void *ctx)
 				strncpy(web_req->plugin_name, temp->valuestring, sizeof(web_req->plugin_name));
 			}else if(!strcmp(item->valuestring, "ListPlugin")){
 				web_req->method = RPCMETHOD_PLUGIN_LIST;
+			}else{
+				DBG_LOG(DBG_DEBUG, "invalid RPCMethod:%s\n", item->valuestring);
 			}
 		}
 
@@ -1087,12 +1151,12 @@ void unix_read(struct bufferevent *bev, void *ctx)
 	}else{
 		bms_list_add(&g_web_request_head, &web_req->web_list);
 	}
-	DBG_LOG(DBG_DEBUG, "add web_list success\n");
+	DBG_LOG(DBG_DEBUG, "add web_list success(addr:%p,%p)\n", web_req, g_web_request_head);
 	return;
 
 __error__:
 	if(request) cJSON_Delete(request);
-	
+
 	root = cJSON_CreateObject();
 	if(root){
 		memset(data, 0, sizeof(data));
@@ -1103,8 +1167,10 @@ __error__:
 		cJSON_AddNumberToObject(root, "result", -1);
 		cJSON_AddStringToObject(root, "message", message);
 		reply = cJSON_PrintUnformatted(root);
-		msg_len = htonl(strlen(reply));
-		bufferevent_write(bev, reply, msg_len);
+		msg_len = strlen(reply);		
+		strcpy(data, reply);
+		printf("33333333333:%s,msg_len=%d\n", data, msg_len);
+		bufferevent_write(bev, reply, strlen(reply));
 		cJSON_Delete(root);
 	}else{
 		bufferevent_write(bev, "{'result':-1}", 13);
@@ -1183,7 +1249,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 		}
 		/* 记录第一个未处理的请求 */
 		else if(node == NULL){
-			DBG_LOG(DBG_DEBUG, "%s[%d]:find node!\n", __func__, __LINE__);
+			DBG_LOG(DBG_TRACE, "%s[%d]:find node(addr:%p,MAC:%s)!\n", __func__, __LINE__, temp,temp->mac);
 			cli_list = g_cli_head;
 			while(cli_list){
 				cli = (BMS_CLIENT_T *)cli_list;
@@ -1219,7 +1285,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 		head = head->next;
 	}
 
-	if(node == NULL || cli == NULL) return;
+	if(node == NULL || cli == NULL || cli->bev == NULL) return;
 	DBG_LOG(DBG_DEBUG, "[%s %d]:mac=%s!\n", __func__, __LINE__, node->mac);
 	cli->local_method = node->method;
 	switch(cli->local_method){
@@ -1385,6 +1451,12 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 	}
 
 	bufferevent_write(cli->bev, data, msg_len);
+
+	/* 判断是否需要向数据库发送ping保活 */
+	if(g_mysql_tick++ >= 21600){
+		g_mysql_tick = 0;
+		mysql_ping(g_mysql_conn);
+	}
 }
 
 
@@ -1421,7 +1493,7 @@ int main(int argc, char **argv)
 
 	unsigned timeout = 5;
 	mysql_options(g_mysql_conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
-
+#if 0
 	// 查询数据
     if (mysql_query(g_mysql_conn, "SELECT * FROM "DB_DEVICE_TABLE)) {
         fprintf(stderr, "查询失败: %s\n", mysql_error(g_mysql_conn));
@@ -1452,7 +1524,7 @@ int main(int argc, char **argv)
     }
 	// 清理资源
 	mysql_free_result(res);
-
+#endif
     struct event_base *base = event_base_new();
 
 	// 创建周期性定时器（每隔1秒触发一次）
