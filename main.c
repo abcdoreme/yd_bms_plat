@@ -411,6 +411,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 	char query_cmd[1024] = {0};
 	unsigned int msg_len = 0;
 	unsigned char data[1024] = {0};
+
+	MYSQL_RES *res = NULL;       // 查询结果集
+    MYSQL_ROW row;        // 单行数据
 	
 	if(bev==NULL || cli==NULL || bms_dev==NULL || buf==NULL || len==NULL){
 		DBG_LOG(DBG_ERR, "invalid param!\n");
@@ -429,8 +432,26 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
 				return -1;
 			}
+
+			/* 通过MAC查询record表,如果没有相应的设备则返回-2 */
+			memset(query_cmd, 0, sizeof(query_cmd));
+			sprintf(query_cmd, "select * from %s where mac = '%s'", DB_RECORD_TABLE, cli->mac);
+			if (mysql_query(g_mysql_conn, query_cmd)) {
+		        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
+				if(root) cJSON_Delete(root);
+				return -1;
+		    }
+			res = mysql_use_result(g_mysql_conn);
+			row = mysql_fetch_row(res);
+			if(row[1] == NULL){
+				result = RESULT_INVALID_INFO;
+			}else{
+				result = RESULT_SUCCESS;
+			}
+			mysql_free_result(res);
+			res = NULL;
 			
-			cJSON_AddNumberToObject(root, "Result", RESULT_SUCCESS);
+			cJSON_AddNumberToObject(root, "Result", result);
 			cJSON_AddNumberToObject(root, "ID", bms_dev->session_id);
 			cJSON_AddStringToObject(root, "ChallengeCode", cli->challenge_code);
 			reply = cJSON_PrintUnformatted(root);
@@ -514,7 +535,7 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 			memset(query_cmd, 0, sizeof(query_cmd));
 			sprintf(query_cmd, "update %s set status=1,tr069='%s' where mac = '%s'", DB_DEVICE_TABLE, cli->tr069Addr, cli->mac);
 			if (mysql_query(g_mysql_conn, query_cmd)) {
-		        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+		        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
 				return -1;
 		    }
 			/* 如果是短连接,在回复了一个heartbeat之后下一次收到HB直接关闭连接 */
@@ -702,7 +723,7 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 					sprintf(query_cmd, "update %s set pluginList='%s' where mac='%s'", DB_DEVICE_TABLE, pluginlist, cli->mac);
 					DBG_LOG(DBG_DEBUG, "%s[%d]:query_cmd:%s\n", __func__, __LINE__, query_cmd);
 					if (mysql_query(g_mysql_conn, query_cmd)) {
-				        DBG_LOG(DBG_ERR, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+				        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
 						return -1;
 				    }
 				}
@@ -841,7 +862,7 @@ void on_read(struct bufferevent *bev, void *ctx)
 	__retry__:
 		sprintf(query_cmd, "select * from %s where mac = '%s'", DB_RECORD_TABLE, device.mac);
 	    if (ret = mysql_query(g_mysql_conn, query_cmd)) {
-	        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+	        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
 			if((ret == ER_CLIENT_INTERACTION_TIMEOUT || ret == CR_SERVER_LOST) && count < 3){
 				count++;
 				mysql_close(g_mysql_conn);
@@ -962,7 +983,7 @@ __reply__:
 		memset(query_cmd, 0, sizeof(query_cmd));
 		sprintf(query_cmd, "update %s set status=0 where mac = '%s'", DB_DEVICE_TABLE, cli->mac);
 		if (mysql_query(g_mysql_conn, query_cmd)) {
-	        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+	        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
 	    }
 		
 		close_connection(bev);
@@ -990,7 +1011,7 @@ void on_error(struct bufferevent *bev, short events, void *ctx)
         close_connection(bev);
 		sprintf(query_cmd, "update %s set status=0 where mac = '%s'", DB_DEVICE_TABLE, cli->mac);
 		if (mysql_query(g_mysql_conn, query_cmd)) {
-	        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
+	        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
 	    }
 		bms_list_delete(&g_cli_head, &cli->cli_list);
 		free(cli);
@@ -1306,7 +1327,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 		head = head->next;
 	}
 
-	if(node == NULL || cli == NULL || cli->bev == NULL) return;
+	if(node == NULL || cli == NULL || cli->bev == NULL) goto __exit__;
 	DBG_LOG(DBG_DEBUG, "[%s %d]:mac=%s!\n", __func__, __LINE__, node->mac);
 	cli->local_method = node->method;
 	switch(cli->local_method){
@@ -1315,7 +1336,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
+				break;
 			}
 			cJSON_AddStringToObject(root, "RPCMethod", "Install");
 			cJSON_AddNumberToObject(root, "ID", cli->session_id);
@@ -1338,7 +1359,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
+				break;
 			}
 			cJSON_AddStringToObject(root, "RPCMethod", "Install_query");
 			cJSON_AddNumberToObject(root, "ID", cli->session_id);
@@ -1357,7 +1378,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
+				break;
 			}
 			cJSON_AddStringToObject(root, "RPCMethod", "Install_cancel");
 			cJSON_AddNumberToObject(root, "ID", cli->session_id);
@@ -1376,7 +1397,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
+				break ;
 			}
 			cJSON_AddStringToObject(root, "RPCMethod", "UnInstall");
 			cJSON_AddNumberToObject(root, "ID", cli->session_id);
@@ -1395,7 +1416,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
+				break ;
 			}
 			cJSON_AddStringToObject(root, "RPCMethod", "Stop");
 			cJSON_AddNumberToObject(root, "ID", cli->session_id);
@@ -1414,7 +1435,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
+				break;
 			}
 			cJSON_AddStringToObject(root, "RPCMethod", "Run");
 			cJSON_AddNumberToObject(root, "ID", cli->session_id);
@@ -1433,7 +1454,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
+				break;
 			}
 			cJSON_AddStringToObject(root, "RPCMethod", "FactoryPlugin");
 			cJSON_AddNumberToObject(root, "ID", cli->session_id);
@@ -1451,7 +1472,7 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
+				break;
 			}
 			cJSON_AddStringToObject(root, "RPCMethod", "ListPlugin");
 			cJSON_AddNumberToObject(root, "ID", cli->session_id);
@@ -1468,16 +1489,22 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 			DBG_LOG(DBG_DEBUG, "RPCMETHOD_HB,ignore\n");
 			break;
 		default:
-			return;
+			break;
 	}
 
-	bufferevent_write(cli->bev, data, msg_len);
+	if(msg_len > 0){
+		bufferevent_write(cli->bev, data, msg_len);
+	}
 
+__exit__:
 	/* 判断是否需要向数据库发送ping保活 */
 	if(g_mysql_tick++ >= 21600){
 		g_mysql_tick = 0;
 		mysql_ping(g_mysql_conn);
+		DBG_LOG(DBG_DEBUG, "[%s %d]:send PING to mysql server!\n", __func__, __LINE__);
 	}
+
+	return;
 }
 
 
@@ -1514,6 +1541,12 @@ int main(int argc, char **argv)
 
 	unsigned timeout = 5;
 	mysql_options(g_mysql_conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+
+	/* 启动时将所有Device的status字段置为0 */
+	if (mysql_query(g_mysql_conn, "UPDATE "DB_DEVICE_TABLE" SET status=0;")) {
+        fprintf(stderr, "复位失败: %s\n", mysql_error(g_mysql_conn));
+    }
+	
 #if 0
 	// 查询数据
     if (mysql_query(g_mysql_conn, "SELECT * FROM "DB_DEVICE_TABLE)) {
