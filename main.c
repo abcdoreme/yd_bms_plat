@@ -912,6 +912,8 @@ void on_read(struct bufferevent *bev, void *ctx)
 			}else{
 				bms_list_add(&g_cli_head, &cli->cli_list);
 			}
+			DBG_LOG(DBG_DEBUG, "%s[%d]:in %s,mac=%s,gponsn=%s,userpass=%s,password=%s,haswifi=%d,ssid=%s,psk=%s\n", __func__, __LINE__, DB_RECORD_TABLE, cli->mac, cli->gponsn,
+				cli->userpass, cli->password, cli->haswifi, cli->ssid, cli->psk);
 		}
 		mysql_free_result(res);
 		res = NULL;
@@ -1105,7 +1107,11 @@ void unix_read(struct bufferevent *bev, void *ctx)
 					strncpy(message, "Invalid Plugin_size", sizeof(message));
 					goto __error__;
 				}
-				web_req->plugin_size = temp->valueint;
+				if(temp->type == cJSON_Number){
+					web_req->plugin_size = temp->valueint;
+				}else if(temp->type == cJSON_String){
+					web_req->plugin_size = atoi(temp->valuestring);
+				}
 			}else if(!strcmp(item->valuestring, "Install_query")){
 				web_req->method = RPCMETHOD_PLUGIN_INSTALL_QUERY;
 				temp = cJSON_GetObjectItem(request, "Plugin_Name");
