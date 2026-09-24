@@ -1,3 +1,6 @@
+#include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -21,14 +24,29 @@
 #include "debug.h"
 #include "md5.h"
 
-#define MYSQL_DATABASE "bms"
+#define BMS_CONFIG_FILE "bms.config"
 #define DB_DEVICE_TABLE "bms_web_device"
 #define DB_RECORD_TABLE "bms_web_record"
 
 #define UNIX_SOCKET_PATH "/tmp/.bms.sock"
 #define RECV_BUF_LEN 2048
+#define MAX_PACKET_LEN (64 * 1024)
 
 MYSQL *g_mysql_conn = NULL; 
+
+struct bms_mysql_config {
+	char host[64];
+	char user[64];
+	char password[128];
+	char database[64];
+	unsigned int port;
+	char unix_socket[128];
+};
+
+struct bms_mysql_config g_mysql_config = {
+	.host = "localhost",
+	.port = 0
+};
 
 /* 已连接设备链表,通过MAC找到对应的设备然后发控制消息 */
 struct bms_list *g_cli_head = NULL;
@@ -38,7 +56,322 @@ struct bms_list *g_web_request_head = NULL;
 
 unsigned int g_mysql_tick = 0;
 
-struct bms_client * find_client(unsigned char *mac)
+char *trim_space(char *str)
+{
+	char *end = NULL;
+
+	if(str == NULL)
+		return NULL;
+
+	while(isspace((unsigned char)*str))
+		str++;
+
+	if(*str == '\0')
+		return str;
+
+	end = str + strlen(str) - 1;
+	while(end > str && isspace((unsigned char)*end))
+		end--;
+	*(end + 1) = '\0';
+
+	return str;
+}
+
+int load_mysql_config(const char *path)
+{
+	FILE *fp = NULL;
+	char line[512] = {0};
+	int line_no = 0;
+
+	fp = fopen(path, "r");
+	if(fp == NULL){
+		fprintf(stderr, "打开配置文件失败: %s, error=%s\n", path, strerror(errno));
+		return -1;
+	}
+
+	while(fgets(line, sizeof(line), fp)){
+		char *key = NULL;
+		char *value = NULL;
+		char *equal = NULL;
+
+		line_no++;
+		key = trim_space(line);
+		if(key[0] == '\0' || key[0] == '#')
+			continue;
+
+		equal = strchr(key, '=');
+		if(equal == NULL){
+			fprintf(stderr, "配置文件格式错误: %s:%d\n", path, line_no);
+			fclose(fp);
+			return -1;
+		}
+
+		*equal = '\0';
+		value = trim_space(equal + 1);
+		key = trim_space(key);
+
+		if(!strcmp(key, "db_host")){
+			snprintf(g_mysql_config.host, sizeof(g_mysql_config.host), "%s", value);
+		}else if(!strcmp(key, "db_user")){
+			snprintf(g_mysql_config.user, sizeof(g_mysql_config.user), "%s", value);
+		}else if(!strcmp(key, "db_password")){
+			snprintf(g_mysql_config.password, sizeof(g_mysql_config.password), "%s", value);
+		}else if(!strcmp(key, "db_database")){
+			snprintf(g_mysql_config.database, sizeof(g_mysql_config.database), "%s", value);
+		}else if(!strcmp(key, "db_port")){
+			g_mysql_config.port = (unsigned int)atoi(value);
+		}else if(!strcmp(key, "db_unix_socket")){
+			snprintf(g_mysql_config.unix_socket, sizeof(g_mysql_config.unix_socket), "%s", value);
+		}else{
+			fprintf(stderr, "忽略未知配置项: %s\n", key);
+		}
+	}
+
+	fclose(fp);
+
+	if(g_mysql_config.user[0] == '\0' || g_mysql_config.password[0] == '\0' || g_mysql_config.database[0] == '\0'){
+		fprintf(stderr, "配置文件缺少必要项: db_user/db_password/db_database\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+int mysql_escape_value(const char *input, char *output, size_t output_size)
+{
+	unsigned long escaped_len = 0;
+
+	if(input == NULL || output == NULL || output_size == 0 || g_mysql_conn == NULL)
+		return -1;
+
+	if(output_size < strlen(input) * 2 + 1)
+		return -1;
+
+	escaped_len = mysql_real_escape_string(g_mysql_conn, output, input, strlen(input));
+	if(escaped_len >= output_size)
+		return -1;
+
+	output[escaped_len] = '\0';
+	return 0;
+}
+
+int build_packet_from_json(char **reply, unsigned char *buf, size_t buf_size, unsigned int *len)
+{
+	size_t reply_len = 0;
+	unsigned int msg_len = 0;
+
+	if(reply == NULL || *reply == NULL || buf == NULL || len == NULL)
+		return -1;
+
+	reply_len = strlen(*reply);
+	if(reply_len + sizeof(msg_len) > buf_size){
+		DBG_LOG(DBG_ERR, "reply too large: %zu\n", reply_len);
+		free(*reply);
+		*reply = NULL;
+		return -1;
+	}
+
+	msg_len = htonl(reply_len);
+	memcpy(buf, &msg_len, sizeof(msg_len));
+	memcpy(buf + sizeof(msg_len), *reply, reply_len);
+	*len = sizeof(msg_len) + reply_len;
+
+	free(*reply);
+	*reply = NULL;
+	return 0;
+}
+
+const char *plugin_rpc_method_name(unsigned char method)
+{
+	switch(method){
+		case RPCMETHOD_PLUGIN_INSTALL:
+			return "Install";
+		case RPCMETHOD_PLUGIN_INSTALL_QUERY:
+			return "Install_query";
+		case RPCMETHOD_PLUGIN_INSTALL_CANCEL:
+			return "Install_cancel";
+		case RPCMETHOD_PLUGIN_UNINSTALL:
+			return "UnInstall";
+		case RPCMETHOD_PLUGIN_STOP:
+			return "Stop";
+		case RPCMETHOD_PLUGIN_RUN:
+			return "Run";
+		case RPCMETHOD_PLUGIN_FACTORY:
+			return "FactoryPlugin";
+		case RPCMETHOD_PLUGIN_LIST:
+			return "ListPlugin";
+		default:
+			return NULL;
+	}
+}
+
+int mysql_update_device_status(const char *mac, int status, const char *tr069)
+{
+	char query_cmd[1024] = {0};
+	char esc_mac[64] = {0};
+	char esc_tr069[256] = {0};
+
+	if(mysql_escape_value(mac, esc_mac, sizeof(esc_mac)) != 0){
+		DBG_LOG(DBG_ERR, "%s[%d]:escape mac failed\n", __func__, __LINE__);
+		return -1;
+	}
+
+	if(tr069){
+		if(mysql_escape_value(tr069, esc_tr069, sizeof(esc_tr069)) != 0){
+			DBG_LOG(DBG_ERR, "%s[%d]:escape tr069 failed\n", __func__, __LINE__);
+			return -1;
+		}
+		snprintf(query_cmd, sizeof(query_cmd), "update %s set status=%d,tr069='%s' where mac = '%s'", DB_DEVICE_TABLE, status, esc_tr069, esc_mac);
+	}else{
+		snprintf(query_cmd, sizeof(query_cmd), "update %s set status=%d where mac = '%s'", DB_DEVICE_TABLE, status, esc_mac);
+	}
+
+	if(mysql_query(g_mysql_conn, query_cmd)){
+		DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
+		return -1;
+	}
+
+	return 0;
+}
+
+int mysql_update_plugin_list(const char *mac, const char *pluginlist)
+{
+	char query_cmd[4096] = {0};
+	char esc_mac[64] = {0};
+	char esc_pluginlist[2048] = {0};
+
+	if(mysql_escape_value(pluginlist, esc_pluginlist, sizeof(esc_pluginlist)) != 0 ||
+		mysql_escape_value(mac, esc_mac, sizeof(esc_mac)) != 0){
+		DBG_LOG(DBG_ERR, "%s[%d]:escape plugin list failed\n", __func__, __LINE__);
+		return -1;
+	}
+
+	snprintf(query_cmd, sizeof(query_cmd), "update %s set pluginList='%s' where mac='%s'", DB_DEVICE_TABLE, esc_pluginlist, esc_mac);
+	DBG_LOG(DBG_DEBUG, "%s[%d]:query_cmd:%s\n", __func__, __LINE__, query_cmd);
+	if(mysql_query(g_mysql_conn, query_cmd)){
+		DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
+		return -1;
+	}
+
+	return 0;
+}
+
+int build_plugin_rpc_packet(struct bms_client *cli, BMS_WEB_REQUEST_T *web_req, unsigned char method, unsigned char *data, size_t data_size, unsigned int *msg_len)
+{
+	const char *rpc_method = plugin_rpc_method_name(method);
+	char *reply = NULL;
+	cJSON *root = NULL;
+	const char *plugin_name = web_req ? web_req->plugin_name : "Plugin_Name";
+
+	if(cli == NULL || rpc_method == NULL || data == NULL || msg_len == NULL)
+		return -1;
+
+	cli->session_id++;
+	root = cJSON_CreateObject();
+	if(root == NULL){
+		DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
+		return -1;
+	}
+
+	cJSON_AddStringToObject(root, "RPCMethod", rpc_method);
+	cJSON_AddNumberToObject(root, "ID", cli->session_id);
+
+	if(method != RPCMETHOD_PLUGIN_LIST){
+		cJSON_AddStringToObject(root, "Plugin_Name", plugin_name);
+	}
+
+	if(method == RPCMETHOD_PLUGIN_INSTALL){
+		if(web_req){
+			cJSON_AddStringToObject(root, "Version", web_req->plugin_version);
+			cJSON_AddStringToObject(root, "Download_url", web_req->url);
+			cJSON_AddNumberToObject(root, "Plugin_size", web_req->plugin_size);
+			cJSON_AddStringToObject(root, "OS", "0");
+		}else{
+			cJSON_AddStringToObject(root, "Version", "Plugin_Version");
+			cJSON_AddStringToObject(root, "Download_url", "url");
+			cJSON_AddStringToObject(root, "Plugin_size", "size");
+			cJSON_AddStringToObject(root, "OS", "Java");
+		}
+	}
+
+	reply = cJSON_PrintUnformatted(root);
+	DBG_LOG(DBG_DEBUG, "%s[%d]:%s: %s\n", __func__, __LINE__, rpc_method, reply);
+	if(build_packet_from_json(&reply, data, data_size, msg_len) != 0){
+		cJSON_Delete(root);
+		return -1;
+	}
+
+	cJSON_Delete(root);
+	return 0;
+}
+
+int write_web_json_response(BMS_WEB_REQUEST_T *web, cJSON *root)
+{
+	char *reply = NULL;
+
+	if(web == NULL || root == NULL)
+		return -1;
+
+	reply = cJSON_PrintUnformatted(root);
+	DBG_LOG(DBG_DEBUG, "%s[%d]:reply to web:%s\n", __func__, __LINE__, reply);
+	if(reply == NULL)
+		return -1;
+
+	if(web->bev){
+		bufferevent_write(web->bev, reply, strlen(reply));
+	}
+	free(reply);
+	return 0;
+}
+
+int send_web_result_response(struct bms_client *cli, cJSON *request, int result, int add_percent, int add_plugin)
+{
+	cJSON *root = NULL;
+	cJSON *item = NULL;
+	char *pluginlist = NULL;
+	int ret = 0;
+
+	if(cli == NULL || cli->web == NULL)
+		return -1;
+
+	root = cJSON_CreateObject();
+	if(root == NULL){
+		DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
+		return -1;
+	}
+
+	cJSON_AddNumberToObject(root, "result", result);
+	cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
+
+	if(add_percent){
+		item = cJSON_GetObjectItem(request, "Percent");
+		if(item){
+			cJSON_AddNumberToObject(root, "Percent", item->valueint);
+		}
+	}
+
+	if(add_plugin){
+		item = cJSON_GetObjectItem(request, "Plugin");
+		if(item){
+			cJSON_DetachItemFromObject(request, "Plugin");
+			cJSON_AddItemToObject(root, "Plugin", item);
+			pluginlist = cJSON_PrintUnformatted(item);
+			DBG_LOG(DBG_DEBUG, "%s[%d]:pluginlist:%s\n", __func__, __LINE__, pluginlist);
+			if(pluginlist == NULL || mysql_update_plugin_list(cli->mac, pluginlist) != 0){
+				if(pluginlist) free(pluginlist);
+				cJSON_Delete(root);
+				return -1;
+			}
+			free(pluginlist);
+		}
+	}
+
+	ret = write_web_json_response(cli->web, root);
+	cJSON_Delete(root);
+	return ret;
+}
+
+struct bms_client * find_client(const char *mac)
 {
 	struct bms_client *cli = NULL;
 	struct bms_list *tmp = g_cli_head;
@@ -140,16 +473,27 @@ void web_list_free()
 
 void connect_to_mysql(void)
 {
+	unsigned timeout = 5;
+	const char *unix_socket = NULL;
+
+	g_mysql_conn = mysql_init(NULL);
+	if (g_mysql_conn == NULL) {
+		fprintf(stderr, "mysql_init() 失败\n");
+		exit(1);
+	}
+
+	mysql_options(g_mysql_conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+	if(g_mysql_config.unix_socket[0] != '\0')
+		unix_socket = g_mysql_config.unix_socket;
+
 	if (mysql_real_connect(
             g_mysql_conn,      // 连接对象
-            "localhost",      // 主机名
-            //"root",       	// 用户名
-            //"hx123456",       // 密码
-            "hx",
-            "Hx@123456",
-            MYSQL_DATABASE,   // 数据库名
-            0,                // 端口 (0 表示默认)
-            NULL,             // Unix socket (NULL 表示默认)
+            g_mysql_config.host,      // 主机名
+            g_mysql_config.user,      // 用户名
+            g_mysql_config.password,  // 密码
+            g_mysql_config.database,  // 数据库名
+            g_mysql_config.port,      // 端口 (0 表示默认)
+            unix_socket,              // Unix socket (NULL 表示默认)
             0                 // 客户端标志
         ) == NULL) {
         fprintf(stderr, "连接失败: %s\n", mysql_error(g_mysql_conn));
@@ -196,12 +540,6 @@ void close_connection(struct bufferevent *bev)
 /* 回复了设备PONG消息之后,剩下的操作(比如:安装、卸载、查询、停用、启动插件等)在on_write中实现 */
 void on_write(struct bufferevent *bev, void *ctx)
 {
-	char *reply = NULL;
-	cJSON* root = NULL;
-	cJSON* item = NULL;
-	char tmp[128] = {0};
-	char md5str[33] = {0};
-	char query_cmd[1024] = {0};
 	unsigned int msg_len = 0;
 	unsigned char data[1024] = {0};
 	
@@ -213,167 +551,12 @@ void on_write(struct bufferevent *bev, void *ctx)
 	if(cli->status != AUTH_SUCCESS){
 		return;
 	}
-	switch(cli->method){
-		case RPCMETHOD_PLUGIN_INSTALL:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Install");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", "Plugin_Name");
-			cJSON_AddStringToObject(root, "Version", "Plugin_Version");
-			cJSON_AddStringToObject(root, "Download_url", "url");
-			cJSON_AddStringToObject(root, "Plugin_size", "size");
-			cJSON_AddStringToObject(root, "OS", "Java");
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Install: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_INSTALL_QUERY:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Install_query");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", "Plugin_Name");
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Install_query: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_INSTALL_CANCEL:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Install_cancel");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", "Plugin_Name");
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Install_cancel: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_UNINSTALL:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "UnInstall");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", "Plugin_Name");
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:UnInstall: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_STOP:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Stop");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", "Plugin_Name");
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Stop: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_RUN:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Run");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", "Plugin_Name");
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Run: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_FACTORY:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "FactoryPlugin");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", "Plugin_Name");
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:FactoryPlugin: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			break;
-		case RPCMETHOD_PLUGIN_LIST:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				return ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "ListPlugin");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:ListPlugin: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;			
-			break;
-		case RPCMETHOD_HB:
+	if(cli->method == RPCMETHOD_HB){
 			DBG_LOG(DBG_DEBUG, "RPCMETHOD_HB,ignore\n");
-			break;
-		default:
-			return;
+		return;
 	}
+	if(build_plugin_rpc_packet(cli, NULL, cli->method, data, sizeof(data), &msg_len) != 0)
+		return;
 
 	/* 更新cli中的method为RPCMETHOD_HB,数据库中的localMethod等到收到设备的回复之后再修改,长连接 */
 	cli->method = RPCMETHOD_HB;
@@ -401,6 +584,7 @@ int calcMD5(struct bms_client *cli, char *md5str, char *result, int result_len)
 
 int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms_device *bms_dev, unsigned char *buf, unsigned int *len)
 {
+	int auth_mode = 0;
 	char *reply = NULL;
 	cJSON* root = NULL;
 	cJSON* item = NULL;
@@ -408,7 +592,8 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 	int result = -1;
 	char tmp[128] = {0};
 	char md5str[33] = {0};
-	char query_cmd[1024] = {0};
+	char query_cmd[4096] = {0};
+	char esc_mac[64] = {0};
 	unsigned int msg_len = 0;
 	unsigned char data[1024] = {0};
 
@@ -435,15 +620,25 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 
 			/* 通过MAC查询record表,如果没有相应的设备则返回-2 */
 			memset(query_cmd, 0, sizeof(query_cmd));
-			sprintf(query_cmd, "select * from %s where mac = '%s'", DB_RECORD_TABLE, cli->mac);
+			if(mysql_escape_value(cli->mac, esc_mac, sizeof(esc_mac)) != 0){
+				DBG_LOG(DBG_ERR, "%s[%d]:escape mac failed\n", __func__, __LINE__);
+				if(root) cJSON_Delete(root);
+				return -1;
+			}
+			snprintf(query_cmd, sizeof(query_cmd), "select * from %s where mac = '%s'", DB_RECORD_TABLE, esc_mac);
 			if (mysql_query(g_mysql_conn, query_cmd)) {
 		        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
 				if(root) cJSON_Delete(root);
 				return -1;
 		    }
 			res = mysql_use_result(g_mysql_conn);
+			if(res == NULL){
+				DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_use_result failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
+				if(root) cJSON_Delete(root);
+				return -1;
+			}
 			row = mysql_fetch_row(res);
-			if(row[1] == NULL){
+			if(row == NULL || row[1] == NULL){
 				result = RESULT_INVALID_INFO;
 			}else{
 				result = RESULT_SUCCESS;
@@ -456,11 +651,10 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 			cJSON_AddStringToObject(root, "ChallengeCode", cli->challenge_code);
 			reply = cJSON_PrintUnformatted(root);
 			DBG_LOG(DBG_DEBUG, "reply BootInitiation: %s\n", reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(buf, &msg_len, 4);
-			memcpy(buf+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			*len = msg_len;
+			if(build_packet_from_json(&reply, buf, RECV_BUF_LEN, len) != 0){
+				cJSON_Delete(root);
+				return -1;
+			}
 			cJSON_Delete(root);
 		}else if(!strcmp(bms_dev->rpcMethod, "Register")){
 			root = cJSON_CreateObject();
@@ -469,27 +663,57 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 				return -1;
 			}
 
-			/* 计算MD5值:ChallengeCode+SN+PONPWD,看设备上报的是否正确 */
-			if(cli->haswifi){
-				sprintf(tmp, "%s%s%s%s%s%s", cli->challenge_code, cli->gponsn, cli->ssid, cli->psk, cli->userpass, cli->password);
-			}else{
-				sprintf(tmp, "%s%s%s", cli->challenge_code, cli->gponsn, cli->password);
-			}
-			calcMD5(cli, tmp, md5str, sizeof(md5str));
-			if(!strcmp(md5str, bms_dev->CheckGateway)){
-				DBG_LOG(DBG_DEBUG, "checkGateway auth success\n");
-				cJSON_AddNumberToObject(root, "Result", RESULT_SUCCESS);
-				cJSON_AddNumberToObject(root, "ID", bms_dev->session_id);
-				/* 计算CheckPlatform: SN+DevRND */
-				if(cli->haswifi){
-					sprintf(tmp, "%s%s%s%s%s", cli->gponsn, cli->ssid, cli->psk, cli->userpass, bms_dev->DevRND);
+			/*  */
+			for(auth_mode=AUTH_MODE_SN_PWD; auth_mode<=AUTH_MODE_MAC_PWD; auth_mode++){
+				memset(tmp, 0, sizeof(tmp));
+				memset(md5str, 0, sizeof(md5str));
+
+				if(auth_mode == AUTH_MODE_SN_PWD){
+					/* 计算MD5值:ChallengeCode+SN+PONPWD,看设备上报的是否正确 */
+					if(cli->haswifi){
+						sprintf(tmp, "%s%s%s%s%s%s", cli->challenge_code, cli->gponsn, cli->ssid, cli->psk, cli->userpass, cli->password);
+					}else{
+						sprintf(tmp, "%s%s%s", cli->challenge_code, cli->gponsn, cli->password);
+					}
+				}else if(auth_mode == AUTH_MODE_MAC_GPONSN){
+					/* 计算MD5值:ChallengeCode+MAC+GPON_SN,看设备上报的是否正确 */
+					sprintf(tmp, "%s%s%s", cli->challenge_code, cli->mac, cli->gponsn);
 				}else{
-					sprintf(tmp, "%s%s", cli->gponsn, bms_dev->DevRND);
+					/* 计算MD5值:ChallengeCode+MAC+PONPWD,看设备上报的是否正确 */
+					sprintf(tmp, "%s%s%s", cli->challenge_code, cli->mac, cli->password);
 				}
+
 				calcMD5(cli, tmp, md5str, sizeof(md5str));
-				cJSON_AddStringToObject(root, "CheckPlatform", md5str);
-				cJSON_AddNumberToObject(root, "Interval", 21600);
-			}else{
+				if(!strcmp(md5str, bms_dev->CheckGateway)){
+					DBG_LOG(DBG_DEBUG, "checkGateway auth success,auth_mode=%d\n", auth_mode);
+					cJSON_AddNumberToObject(root, "Result", RESULT_SUCCESS);
+					cJSON_AddNumberToObject(root, "ID", bms_dev->session_id);
+
+					memset(tmp, 0, sizeof(tmp));
+					memset(md5str, 0, sizeof(md5str));
+					/* 计算CheckPlatform: SN+DevRND */
+					if(auth_mode == AUTH_MODE_SN_PWD){
+						if(cli->haswifi){
+							sprintf(tmp, "%s%s%s%s%s", cli->gponsn, cli->ssid, cli->psk, cli->userpass, bms_dev->DevRND);
+						}else{
+							sprintf(tmp, "%s%s", cli->gponsn, bms_dev->DevRND);
+						}
+					}else if(auth_mode == AUTH_MODE_MAC_GPONSN){
+						/* 计算MD5值:ChallengeCode+MAC+GPON_SN,看设备上报的是否正确 */
+						sprintf(tmp, "%s%s%s", cli->challenge_code, cli->mac, cli->gponsn);
+					}else{
+						/* 计算MD5值:ChallengeCode+MAC+PONPWD,看设备上报的是否正确 */
+						sprintf(tmp, "%s%s%s", cli->challenge_code, cli->mac, cli->password);
+					}
+					calcMD5(cli, tmp, md5str, sizeof(md5str));
+					cJSON_AddStringToObject(root, "CheckPlatform", md5str);
+					cJSON_AddNumberToObject(root, "Interval", cli->negocucle);
+					cli->auth_mode = auth_mode;
+					break;
+				}
+			}
+			
+			if(auth_mode > AUTH_MODE_MAC_PWD){
 				DBG_LOG(DBG_DEBUG, "checkGateway(local:%s,remote:%s) auth failed\n", md5str, bms_dev->CheckGateway);
 				cJSON_AddNumberToObject(root, "Result", RESULT_INVALID_CHECKGATEWAY);
 				cJSON_AddNumberToObject(root, "ID", bms_dev->session_id);
@@ -497,11 +721,10 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 			
 			reply = cJSON_PrintUnformatted(root);
 			DBG_LOG(DBG_DEBUG, "reply Register: %s\n", reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(buf, &msg_len, 4);
-			memcpy(buf+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			*len = msg_len;
+			if(build_packet_from_json(&reply, buf, RECV_BUF_LEN, len) != 0){
+				cJSON_Delete(root);
+				return -1;
+			}
 			cJSON_Delete(root);
 		}else if(!strcmp(bms_dev->rpcMethod, "Hb")){
 			/* 如果没有待执行的操作,关闭连接 */
@@ -521,10 +744,10 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 			cJSON_AddNumberToObject(root, "Interval", cli->heartbeat);
 			reply = cJSON_PrintUnformatted(root);
 			DBG_LOG(DBG_DEBUG, "reply HB: %s\n", reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
+			if(build_packet_from_json(&reply, data, sizeof(data), &msg_len) != 0){
+				cJSON_Delete(root);
+				return -1;
+			}
 			
 			bufferevent_write(bev, data, msg_len);
 			cJSON_Delete(root);
@@ -532,12 +755,9 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 
 			/* 回复PONG之后返回,其他操作放在on_write中 */
 			cli->status = AUTH_SUCCESS;
-			memset(query_cmd, 0, sizeof(query_cmd));
-			sprintf(query_cmd, "update %s set status=1,tr069='%s' where mac = '%s'", DB_DEVICE_TABLE, cli->tr069Addr, cli->mac);
-			if (mysql_query(g_mysql_conn, query_cmd)) {
-		        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
+			if(mysql_update_device_status(cli->mac, 1, cli->tr069Addr) != 0){
 				return -1;
-		    }
+			}
 			/* 如果是短连接,在回复了一个heartbeat之后下一次收到HB直接关闭连接 */
 			if(cli->isShortConn && cli->local_method == RPCMETHOD_HB){
 				cli->local_method = RPCMETHOD_NONE;
@@ -554,191 +774,22 @@ int protocol_process(struct bufferevent *bev, struct bms_client *cli, struct bms
 		if(cli->web == NULL || cli->web->method != cli->local_method){
 			return 0;
 		}
-		switch(cli->local_method){
-			case RPCMETHOD_PLUGIN_INSTALL:
-				request = cJSON_Parse(buf+4);
-				item = cJSON_GetObjectItem(request, "Result");
-				if(item){
-					result = item->valueint;
-				}
-				root = cJSON_CreateObject();
-				if (root == NULL) {
-					DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-					return -1;
-				}
-				cJSON_AddNumberToObject(root, "result", result);
-				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
-				reply = cJSON_PrintUnformatted(root);
-				if(cli->web && cli->web->bev){
-					bufferevent_write(cli->web->bev, reply, strlen(reply));
-				}
-				cJSON_Delete(root);
-				cJSON_Delete(request);
-				break;
-			case RPCMETHOD_PLUGIN_INSTALL_QUERY:
-				request = cJSON_Parse(buf+4);
-				item = cJSON_GetObjectItem(request, "Result");
-				if(item){
-					result = item->valueint;
-				}
-				root = cJSON_CreateObject();
-				if (root == NULL) {
-					DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-					return -1;
-				}
-				cJSON_AddNumberToObject(root, "result", result);
-				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
-				item = cJSON_GetObjectItem(request, "Percent");
-				if(item){
-					cJSON_AddNumberToObject(root, "Percent", item->valueint);
-				}
-				reply = cJSON_PrintUnformatted(root);
-				if(cli->web && cli->web->bev){
-					bufferevent_write(cli->web->bev, reply, strlen(reply));
-				}
-				cJSON_Delete(root);
-				cJSON_Delete(request);
-				break;
-			case RPCMETHOD_PLUGIN_INSTALL_CANCEL:
-				request = cJSON_Parse(buf+4);
-				item = cJSON_GetObjectItem(request, "Result");
-				if(item){
-					result = item->valueint;
-				}
-				root = cJSON_CreateObject();
-				if (root == NULL) {
-					DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-					return -1;
-				}
-				cJSON_AddNumberToObject(root, "result", result);
-				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
-				reply = cJSON_PrintUnformatted(root);
-				if(cli->web && cli->web->bev){
-					bufferevent_write(cli->web->bev, reply, strlen(reply));
-				}
-				cJSON_Delete(root);
-				cJSON_Delete(request);
-				break;
-			case RPCMETHOD_PLUGIN_UNINSTALL:
-				request = cJSON_Parse(buf+4);
-				item = cJSON_GetObjectItem(request, "Result");
-				if(item){
-					result = item->valueint;
-				}
-				root = cJSON_CreateObject();
-				if (root == NULL) {
-					DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-					return -1;
-				}
-				cJSON_AddNumberToObject(root, "result", result);
-				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
-				reply = cJSON_PrintUnformatted(root);
-				if(cli->web && cli->web->bev){
-					bufferevent_write(cli->web->bev, reply, strlen(reply));
-				}
-				cJSON_Delete(root);
-				cJSON_Delete(request);
-				break;
-			case RPCMETHOD_PLUGIN_STOP:
-				request = cJSON_Parse(buf+4);
-				item = cJSON_GetObjectItem(request, "Result");
-				if(item){
-					result = item->valueint;
-				}
-				root = cJSON_CreateObject();
-				if (root == NULL) {
-					DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-					return -1;
-				}
-				cJSON_AddNumberToObject(root, "result", result);
-				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
-				reply = cJSON_PrintUnformatted(root);
-				if(cli->web && cli->web->bev){
-					bufferevent_write(cli->web->bev, reply, strlen(reply));
-				}
-				cJSON_Delete(root);
-				cJSON_Delete(request);
-				break;
-			case RPCMETHOD_PLUGIN_RUN:
-				request = cJSON_Parse(buf+4);
-				item = cJSON_GetObjectItem(request, "Result");
-				if(item){
-					result = item->valueint;
-				}
-				root = cJSON_CreateObject();
-				if (root == NULL) {
-					DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-					return -1;
-				}
-				cJSON_AddNumberToObject(root, "result", result);
-				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
-				reply = cJSON_PrintUnformatted(root);
-				if(cli->web && cli->web->bev){
-					bufferevent_write(cli->web->bev, reply, strlen(reply));
-				}
-				cJSON_Delete(root);
-				cJSON_Delete(request);
-				break;
-			case RPCMETHOD_PLUGIN_FACTORY:
-				request = cJSON_Parse(buf+4);
-				item = cJSON_GetObjectItem(request, "Result");
-				if(item){
-					result = item->valueint;
-				}
-				root = cJSON_CreateObject();
-				if (root == NULL) {
-					DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-					return -1;
-				}
-				cJSON_AddNumberToObject(root, "result", result);
-				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
-				reply = cJSON_PrintUnformatted(root);
-				if(cli->web && cli->web->bev){
-					bufferevent_write(cli->web->bev, reply, strlen(reply));
-				}
-				cJSON_Delete(root);
-				cJSON_Delete(request);
-				break;
-			case RPCMETHOD_PLUGIN_LIST:
-				DBG_LOG(DBG_DEBUG, "get plugin list\n");
-				request = cJSON_Parse(buf+4);
-				item = cJSON_GetObjectItem(request, "Result");
-				if(item){
-					result = item->valueint;
-				}
-				root = cJSON_CreateObject();
-				if (root == NULL) {
-					DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-					return -1;
-				}
-				cJSON_AddNumberToObject(root, "result", result);
-				cJSON_AddNumberToObject(root, "ID", cli->web->session_id);
-				item = cJSON_GetObjectItem(request, "Plugin");
-				if(item){
-					cJSON_DetachItemFromObject(request, "Plugin");
-					cJSON_AddItemToObject(root, "Plugin", item);
-					char *pluginlist = cJSON_PrintUnformatted(item);
-					DBG_LOG(DBG_DEBUG, "%s[%d]:pluginlist:%s\n", __func__, __LINE__, pluginlist);
-					memset(query_cmd, 0, sizeof(query_cmd));
-					sprintf(query_cmd, "update %s set pluginList='%s' where mac='%s'", DB_DEVICE_TABLE, pluginlist, cli->mac);
-					DBG_LOG(DBG_DEBUG, "%s[%d]:query_cmd:%s\n", __func__, __LINE__, query_cmd);
-					if (mysql_query(g_mysql_conn, query_cmd)) {
-				        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
-						return -1;
-				    }
-				}
-				reply = cJSON_PrintUnformatted(root);
-				
-				DBG_LOG(DBG_DEBUG, "%s[%d]:reply to web:%s\n", __func__, __LINE__, reply);
-				if(cli->web && cli->web->bev){
-					bufferevent_write(cli->web->bev, reply, strlen(reply));
-				}
-				cJSON_Delete(root);
-				cJSON_Delete(request);
-				break;
-			default:
-				break;
+		request = cJSON_Parse(buf+4);
+		if(request == NULL)
+			return -1;
+
+		item = cJSON_GetObjectItem(request, "Result");
+		if(item){
+			result = item->valueint;
 		}
+
+		if(send_web_result_response(cli, request, result,
+			cli->local_method == RPCMETHOD_PLUGIN_INSTALL_QUERY,
+			cli->local_method == RPCMETHOD_PLUGIN_LIST) != 0){
+			cJSON_Delete(request);
+			return -1;
+		}
+		cJSON_Delete(request);
 		/* 更新localMethod为RPCMETHOD_HB,长连接 */
 		cli->method = RPCMETHOD_HB;
 		/* 如果是短连接,下一次收到HB的时候直接关闭连接 */
@@ -774,6 +825,7 @@ void on_read(struct bufferevent *bev, void *ctx)
 	cJSON* item = NULL;
 	char* reply = NULL;
 	char query_cmd[1024] = {0};
+	char esc_mac[64] = {0};
 	unsigned int msg_len = 0;
 	unsigned char mac[6] = {0};	
 	struct bms_device device = {0};
@@ -786,24 +838,48 @@ void on_read(struct bufferevent *bev, void *ctx)
 	struct bms_client *cli = (struct bms_client *)ctx;
     struct evbuffer *input = bufferevent_get_input(bev);
     size_t len = evbuffer_get_length(input);
-    
+
+	while(len >= sizeof(msg_len)){
+		size_t packet_len = 0;
+		size_t data_size = sizeof(recv_buf);
+		memset(&device, 0, sizeof(device));
+		memset(recv_buf, 0, sizeof(recv_buf));
+		data = NULL;
+		request = NULL;
+		root = NULL;
+		reply = NULL;
+		msg_len = 0;
+
 	/* 报文结构: msg_len + payload, 其中msg_len长度为4字节(big endian),指示payload的长度 */
 	/* 检查报文是否完整:报文太大时可能分片了; 将最开始四个字节拷贝出来 */
-	if(len < 4) return;
-
 	evbuffer_copyout(input, &msg_len, sizeof(msg_len));
 	msg_len = ntohl(msg_len);
-	if(len < msg_len+sizeof(msg_len)){
+	if(msg_len == 0 || msg_len > MAX_PACKET_LEN){
+		DBG_LOG(DBG_ERR, "invalid message length:%u\n", msg_len);
+		close_connection(bev);
+		bms_list_delete(&g_cli_head, &cli->cli_list);
+		free(cli);
+		return;
+	}
+
+	packet_len = msg_len + sizeof(msg_len);
+	if(len < packet_len){
 		DBG_LOG(DBG_DEBUG, "msg not completed,return!\n");
 		return;
 	}
 
-	if(len <= RECV_BUF_LEN){
-		data = recv_buf;
-	}else{
-		data = malloc(len);
+		if(packet_len + 1 <= RECV_BUF_LEN){
+			data = recv_buf;
+		}else{
+			data = malloc(packet_len + 1);
+			data_size = packet_len + 1;
+			if(data == NULL){
+				DBG_LOG(DBG_ERR, "malloc packet buffer failed!\n");
+				return;
+		}
 	}
-    evbuffer_remove(input, data, len);
+    evbuffer_remove(input, data, packet_len);
+	data[packet_len] = '\0';
 	DBG_LOG(DBG_DEBUG, "recv message(len=%d):%s!\n", msg_len, data+4);	
 
 	request = cJSON_Parse(data+4);
@@ -860,8 +936,12 @@ void on_read(struct bufferevent *bev, void *ctx)
 	if(0 == strlen(cli->mac)){
 		/* 在record表中查询是否存在此设备,若不存在返回-2 */
 	__retry__:
-		sprintf(query_cmd, "select * from %s where mac = '%s'", DB_RECORD_TABLE, device.mac);
-	    if (ret = mysql_query(g_mysql_conn, query_cmd)) {
+		if(mysql_escape_value(device.mac, esc_mac, sizeof(esc_mac)) != 0){
+			DBG_LOG(DBG_ERR, "%s[%d]:escape mac failed\n", __func__, __LINE__);
+			goto __exit__;
+		}
+		snprintf(query_cmd, sizeof(query_cmd), "select * from %s where mac = '%s'", DB_RECORD_TABLE, esc_mac);
+	    if ((ret = mysql_query(g_mysql_conn, query_cmd)) != 0) {
 	        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
 			if((ret == ER_CLIENT_INTERACTION_TIMEOUT || ret == CR_SERVER_LOST) && count < 3){
 				count++;
@@ -874,23 +954,27 @@ void on_read(struct bufferevent *bev, void *ctx)
 	    }
 		g_mysql_tick = 0;
 
-	    res = mysql_use_result(g_mysql_conn);
-		row = mysql_fetch_row(res);
+		res = mysql_use_result(g_mysql_conn);
+		if(res == NULL){
+			DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_use_result failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
+			goto __exit__;
+			}
+			row = mysql_fetch_row(res);
 	    if (row == NULL) {
 			root = cJSON_CreateObject();
 			if (root == NULL) {
 				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
 				goto __exit__;
-			}
+				}
 			cJSON_AddNumberToObject(root, "Result", RESULT_INVALID_INFO);
 			cJSON_AddNumberToObject(root, "ID", device.session_id);
 			reply = cJSON_PrintUnformatted(root);
 			DBG_LOG(DBG_DEBUG, "device not invlaid:res=%p,reply: %s\n", res, reply);
-			memset(data, 0, len+1);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
+			memset(data, 0, data_size);
+			if(build_packet_from_json(&reply, data, data_size, &msg_len) != 0){
+				cJSON_Delete(root);
+				goto __exit__;
+				}
 
 			cJSON_Delete(root);
 			goto __reply__;
@@ -906,6 +990,7 @@ void on_read(struct bufferevent *bev, void *ctx)
 			if(row[8]) strncpy(cli->province, row[8], sizeof(cli->province));
 			if(row[9]) cli->isShortConn = atoi(row[9]);
 			if(row[10]) cli->heartbeat = atoi(row[10]);
+			if(row[10]) cli->negocucle = atoi(row[11]);
 			cli->local_method = RPCMETHOD_HB;
 			if(g_cli_head == NULL){
 				g_cli_head = &cli->cli_list;
@@ -924,7 +1009,7 @@ void on_read(struct bufferevent *bev, void *ctx)
 	sprintf(query_cmd, "select * from %s where mac = '%s'", DB_DEVICE_TABLE, cli->mac);
 	if (mysql_query(g_mysql_conn, query_cmd)) {
         DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
-		goto __exit__;
+		return;
     }
 
     res = mysql_use_result(g_mysql_conn);
@@ -937,11 +1022,11 @@ void on_read(struct bufferevent *bev, void *ctx)
 			sprintf(query_cmd, "insert into %s (mac,session_id,RPCMethod,localMethod) values('%s',%d,'%s',%d);", DB_DEVICE_TABLE, device.mac, device.session_id, device.rpcMethod, RPCMETHOD_HB);
 			if (mysql_query(g_mysql_conn, query_cmd)) {
 		        DBG_LOG(DBG_DEBUG, "mysql_query add device failed: %s\n", mysql_error(g_mysql_conn));
-				goto __exit__;
+				return;
 		    }
 		}else{
 			/* 当设备初次注册时,只处理BootInitiation事件 */
-			goto __exit__;
+			return;
 		}
 	}else{
 		/* 当设备存在时,更新相关字段 */
@@ -952,13 +1037,13 @@ void on_read(struct bufferevent *bev, void *ctx)
 			sprintf(query_cmd, "update %s set session_id=%d, RPCMethod='%s', tr069Addr='%s' where mac='%s';", DB_DEVICE_TABLE, device.session_id, device.rpcMethod, device.tr069Addr, device.mac);
 			if (mysql_query(g_mysql_conn, query_cmd)) {
 		        DBG_LOG(DBG_DEBUG, "mysql_query update device failed: %s\n", mysql_error(g_mysql_conn));
-				goto __exit__;
+				return;
 		    }
 		}else{
 			sprintf(query_cmd, "select * from %s where mac = '%s'", DB_DEVICE_TABLE, cli->mac);
 			if (mysql_query(g_mysql_conn, query_cmd)) {
 		        DBG_LOG(DBG_DEBUG, "mysql_query failed: %s\n", mysql_error(g_mysql_conn));
-				goto __exit__;
+				return;
 		    }
 			res = mysql_use_result(g_mysql_conn);
 			row = mysql_fetch_row(res);
@@ -974,19 +1059,15 @@ void on_read(struct bufferevent *bev, void *ctx)
 
 	/* 处理协议报文 */
 	msg_len = 0;
-	if(0 > protocol_process(bev, cli, &device, data, &msg_len)){
-		goto __exit__;
+		if(0 > protocol_process(bev, cli, &device, data, &msg_len)){
+			goto __exit__;
 	
 	}
 
 __reply__:
 	if(cli->close){
 		cli->bev = NULL;
-		memset(query_cmd, 0, sizeof(query_cmd));
-		sprintf(query_cmd, "update %s set status=0 where mac = '%s'", DB_DEVICE_TABLE, cli->mac);
-		if (mysql_query(g_mysql_conn, query_cmd)) {
-	        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
-	    }
+		mysql_update_device_status(cli->mac, 0, NULL);
 		
 		close_connection(bev);
 		bms_list_delete(&g_cli_head, &cli->cli_list);
@@ -996,8 +1077,15 @@ __reply__:
 	}
 	
 __exit__:
-	if(len > RECV_BUF_LEN && data)
+	if(res){
+		mysql_free_result(res);
+		res = NULL;
+	}
+	if(data && data != recv_buf)
     	free(data);
+
+	len = evbuffer_get_length(input);
+	}
 
 	return;
 }
@@ -1005,18 +1093,16 @@ __exit__:
 // 错误处理
 void on_error(struct bufferevent *bev, short events, void *ctx)
 {
-	char query_cmd[1024] = {0};
 	BMS_CLIENT_T *cli = (BMS_CLIENT_T*)ctx;
 	DBG_LOG(DBG_DEBUG, "%s[%d]: ctx=%p, event=0x%X!\n", __func__, __LINE__, ctx, events);
 	
     if (events & BEV_EVENT_ERROR || events & BEV_EVENT_EOF) {
         close_connection(bev);
-		sprintf(query_cmd, "update %s set status=0 where mac = '%s'", DB_DEVICE_TABLE, cli->mac);
-		if (mysql_query(g_mysql_conn, query_cmd)) {
-	        DBG_LOG(DBG_DEBUG, "%s[%d]:mysql_query failed: %s\n", __func__, __LINE__, mysql_error(g_mysql_conn));
-	    }
-		bms_list_delete(&g_cli_head, &cli->cli_list);
-		free(cli);
+		if(cli){
+			mysql_update_device_status(cli->mac, 0, NULL);
+			bms_list_delete(&g_cli_head, &cli->cli_list);
+			free(cli);
+		}
     }
 }
 
@@ -1046,6 +1132,7 @@ void on_connect(struct evconnlistener *listener, evutil_socket_t fd,
 	}
 	memset(cli, 0, sizeof(struct bms_client));
 	cli->bev = bev;
+	cli->auth_mode = AUTH_MODE_SN_PWD; //认证模式默认为：拼接SN+PonPWD
 	memcpy(&cli->client_addr, addr, sizeof(struct sockaddr));
 	
     // 设置读写回调
@@ -1211,10 +1298,12 @@ __error__:
 		cJSON_AddNumberToObject(root, "result", -1);
 		cJSON_AddStringToObject(root, "message", message);
 		reply = cJSON_PrintUnformatted(root);
-		msg_len = strlen(reply);		
-		strcpy(data, reply);
-		printf("33333333333:%s,msg_len=%d\n", data, msg_len);
-		bufferevent_write(bev, reply, strlen(reply));
+		if(reply){
+			msg_len = strlen(reply);
+			bufferevent_write(bev, reply, msg_len);
+			free(reply);
+			reply = NULL;
+		}
 		cJSON_Delete(root);
 	}else{
 		bufferevent_write(bev, "{'result':-1}", 13);
@@ -1241,7 +1330,7 @@ void unix_error(struct bufferevent *bev, short events, void *ctx)
     if (events & BEV_EVENT_ERROR || events & BEV_EVENT_EOF) {
         close_connection(bev);
 		bms_list_delete(&g_web_request_head, &web->web_list);
-		if(cli = find_client(web->mac)){
+		if(cli == find_client(web->mac)){
 			cli->web = NULL;
 		}
 		free(web);
@@ -1274,11 +1363,6 @@ void unix_accept(struct evconnlistener *listener, evutil_socket_t fd, struct soc
 // 定时器回调函数
 void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 {
-	char *reply = NULL;
-	cJSON* root = NULL;
-	cJSON* item = NULL;
-	char tmp[128] = {0};
-	char md5str[33] = {0};
 	unsigned int msg_len = 0;
 	unsigned char data[1024] = {0};
 	BMS_CLIENT_T *cli = NULL;
@@ -1336,166 +1420,10 @@ void periodic_timer_callback(evutil_socket_t fd, short what, void *arg)
 	if(node == NULL || cli == NULL || cli->bev == NULL) goto __exit__;
 	DBG_LOG(DBG_DEBUG, "[%s %d]:mac=%s!\n", __func__, __LINE__, node->mac);
 	cli->local_method = node->method;
-	switch(cli->local_method){
-		case RPCMETHOD_PLUGIN_INSTALL:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				break;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Install");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", node->plugin_name);
-			cJSON_AddStringToObject(root, "Version", node->plugin_version);
-			cJSON_AddStringToObject(root, "Download_url", node->url);
-			cJSON_AddNumberToObject(root, "Plugin_size", node->plugin_size);
-			cJSON_AddStringToObject(root, "OS", "0");
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Install: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_INSTALL_QUERY:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				break;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Install_query");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", node->plugin_name);
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Install_query: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_INSTALL_CANCEL:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				break;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Install_cancel");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", node->plugin_name);
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Install_cancel: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_UNINSTALL:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				break ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "UnInstall");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", node->plugin_name);
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:UnInstall: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_STOP:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				break ;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Stop");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", node->plugin_name);
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Stop: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_RUN:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				break;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "Run");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", node->plugin_name);
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:Run: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_PLUGIN_FACTORY:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				break;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "FactoryPlugin");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			cJSON_AddStringToObject(root, "Plugin_Name", node->plugin_name);
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:FactoryPlugin: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			break;
-		case RPCMETHOD_PLUGIN_LIST:
-			cli->session_id++;
-			root = cJSON_CreateObject();
-			if (root == NULL) {
-				DBG_LOG(DBG_ERR, "[%s %d]:malloc json object failed , leave!\n", __func__, __LINE__);
-				break;
-			}
-			cJSON_AddStringToObject(root, "RPCMethod", "ListPlugin");
-			cJSON_AddNumberToObject(root, "ID", cli->session_id);
-			reply = cJSON_PrintUnformatted(root);
-			DBG_LOG(DBG_DEBUG, "%s[%d]:ListPlugin: %s\n", __func__, __LINE__, reply);
-			msg_len = htonl(strlen(reply));
-			memcpy(data, &msg_len, 4);
-			memcpy(data+4, reply, strlen(reply));
-			msg_len = 4+strlen(reply);
-			cJSON_Delete(root);
-			root = NULL;
-			break;
-		case RPCMETHOD_HB:
-			DBG_LOG(DBG_DEBUG, "RPCMETHOD_HB,ignore\n");
-			break;
-		default:
-			break;
+	if(cli->local_method == RPCMETHOD_HB){
+		DBG_LOG(DBG_DEBUG, "RPCMETHOD_HB,ignore\n");
+	}else if(build_plugin_rpc_packet(cli, node, cli->local_method, data, sizeof(data), &msg_len) != 0){
+		goto __exit__;
 	}
 
 	if(msg_len > 0){
@@ -1518,35 +1446,14 @@ int main(int argc, char **argv)
 {
 	MYSQL_RES *res;       // 查询结果集
     MYSQL_ROW row;        // 单行数据
-    
-	// 1. 初始化连接对象
-    g_mysql_conn = mysql_init(NULL);
-    if (g_mysql_conn == NULL) {
-        fprintf(stderr, "mysql_init() 失败\n");
-        exit(1);
-    }
 
-    // 2. 连接到数据库
-    if (mysql_real_connect(
-            g_mysql_conn,      // 连接对象
-            "localhost",      // 主机名
-            //"root",       	// 用户名
-            //"hx123456",       // 密码
-            "hx",
-            "Hx@123456",
-            MYSQL_DATABASE,   // 数据库名
-            0,                // 端口 (0 表示默认)
-            NULL,             // Unix socket (NULL 表示默认)
-            0                 // 客户端标志
-        ) == NULL) {
-        fprintf(stderr, "连接失败: %s\n", mysql_error(g_mysql_conn));
-        mysql_close(g_mysql_conn);
-        exit(1);
-    }
+	if(load_mysql_config(BMS_CONFIG_FILE) != 0){
+		return EXIT_FAILURE;
+	}
+
+    // 连接到数据库
+	connect_to_mysql();
 	DBG_LOG(DBG_DEBUG, "成功连接到 MySQL 数据库！\n");
-
-	unsigned timeout = 5;
-	mysql_options(g_mysql_conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
 
 	/* 启动时将所有Device的status字段置为0 */
 	if (mysql_query(g_mysql_conn, "UPDATE "DB_DEVICE_TABLE" SET status=0;")) {
@@ -1659,4 +1566,3 @@ __exit__:
 	
     return 0;
 }
-

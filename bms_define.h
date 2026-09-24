@@ -29,6 +29,14 @@ enum {
 	AUTH_SUCCESS
 };
 
+enum {
+	AUTH_MODE_NONE = 0,
+	AUTH_MODE_SN_PWD,
+	AUTH_MODE_MAC_GPONSN,
+	AUTH_MODE_MAC_PWD
+};
+
+
 struct bms_device {
 	unsigned char localMethod;
 	char mac[18];
@@ -51,7 +59,9 @@ typedef struct bms_client {
 	unsigned char pendding;
 	unsigned char local_method;	//本地method, 记录web传过来的method
 	unsigned char isShortConn;
+	unsigned char auth_mode; //1：拼接SN+PonPWD, 2：MAC+原始SN, 3：MAC+PonPWD
 	int heartbeat;
+	int negocucle;	//协商周期
 	int session_id;
 	struct sockaddr client_addr;
 	char challenge_code[18];
